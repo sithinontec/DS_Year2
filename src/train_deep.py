@@ -16,11 +16,13 @@ Deep Learning pipeline:
 Both models preserve and use special character signals.
 """
 
+from json import encoder
 import os
 import sys
 import numpy as np
 import joblib
 
+from sklearn.calibration import LabelEncoder
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -135,7 +137,19 @@ class BiLSTMClassifier(nn.Module):
         special_out = self.special_fc(special_feats)         # (B, 64)
         combined    = torch.cat([context, special_out], dim=1)
         return self.classifier(combined)
-
+    
+def clean_labels(df, name):
+    # 1. Fill any NaNs with a placeholder (e.g., 0) or drop them
+    col = df["label"].fillna(0) 
+    
+    # 2. Force to numeric, turning errors into NaNs so we can catch them
+    numeric_col = pd.to_numeric(col, errors='coerce')
+    
+    if numeric_col.isna().any():
+        print(f"⚠️ Warning: Found non-numeric values in {name}! Check your data.")
+        numeric_col = numeric_col.fillna(0) # Final safety fill
+        
+    return numeric_col.astype(np.int64).values
 
 def train_bilstm(splits, save_dir="models",
                  embed_dim=128, hidden_dim=256,
@@ -149,10 +163,10 @@ def train_bilstm(splits, save_dir="models",
     val_texts   = splits["val_df"]["text_clean"].tolist()
     test_texts  = splits["test_df"]["text_clean"].tolist()
 
-    y_train = splits["train_df"]["label"].values
-    y_val   = splits["val_df"]["label"].values
-    y_test  = splits["test_df"]["label"].values
-
+    y_train = clean_labels(splits["train_df"], "Train")
+    y_val   = clean_labels(splits["val_df"], "Val")
+    y_test  = clean_labels(splits["test_df"], "Test")
+    
     # Special char features
     X_sc_train = scaler.fit_transform(extractor.transform(train_texts).values)
     X_sc_val   = scaler.transform(extractor.transform(val_texts).values)
