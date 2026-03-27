@@ -167,9 +167,9 @@ def train_classical_models(
     val_texts   = splits["val_df"]["text_clean"].tolist()
     test_texts  = splits["test_df"]["text_clean"].tolist()
 
-    y_train = splits["train_df"]["label"].values
-    y_val   = splits["val_df"]["label"].values
-    y_test  = splits["test_df"]["label"].values
+    y_train = splits["train_df"]["label_num"].values
+    y_val   = splits["val_df"]["label_num"].values
+    y_test  = splits["test_df"]["label_num"].values
 
     print("\n" + "=" * 60)
     print("BUILDING FEATURE MATRICES")
@@ -255,7 +255,7 @@ def _eval_and_save(model, name, X_val, y_val, X_test, y_test,
         print(f"  Test ROC-AUC : {test_auc:.4f}")
     print("\n  Classification Report (Test):")
     print(classification_report(y_test, model.predict(X_test),
-                                target_names=["Real", "Fake/AI"]))
+                                target_names=["OR (real)", "CG (generated)"]))
 
     path = os.path.join(save_dir, f"{name}.pkl")
     joblib.dump(model, path)

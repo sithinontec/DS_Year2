@@ -1,13 +1,26 @@
 """
-feature_engineering.py
-=======================
-Extracts special character, punctuation, and emoji features from review text.
-These features are PRESERVED (not stripped) as they are strong signals for
-AI-generated vs. human-written text.
+feature_engineering.py  —  unified CG + AI feature extractor
+=============================================================
+Covers signals from BOTH text types:
 
-Key insight:
-  - AI-generated text tends to be uniform, punctuation-balanced, emoji-free
-  - Human text is noisy: repeated !!!, slang, emojis, typos, non-ASCII chars
+  CG (computer-generated, 2022 dataset, GPT-2/3 era):
+    • Truncation mid-sentence (64.8%)
+    • Glued sentences  "love it.This"  (12.4%)
+    • Low vocab richness (TTR 0.72)
+    • Uniform sentence lengths (burstiness 0.37)
+    • Repeated bigrams/trigrams ("well-written... well-told")
+    • No ALL CAPS, few exclamations
+
+  AI (modern LLM dataset):
+    • Emojis — 54.5% of reviews contain them
+    • Very short reviews (~30 words vs ~75 OR)
+    • High TTR (0.93) — varied vocabulary per short text
+    • Very low contractions (18% vs 68% OR)
+    • Polished sentence structure, high burstiness (0.60)
+    • Truncation still present (17.9%) but less extreme
+    • NO glued sentences
+
+Total features: 48
 """
 
 import re
@@ -17,286 +30,276 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 
-try:
-    import emoji as emoji_lib
-    EMOJI_AVAILABLE = True
-except ImportError:
-    EMOJI_AVAILABLE = False
-    print("[WARNING] 'emoji' package not installed. Emoji features will be zeros.")
-
-
-# ---------------------------------------------------------------------------
-# Core extractor
-# ---------------------------------------------------------------------------
 
 class SpecialCharFeatureExtractor:
-    """
-    Extracts a rich set of special character and emoji features from text.
-    All features are numeric and can be concatenated with TF-IDF vectors.
-    """
 
-    # Patterns compiled once for speed
-    _EXCLAIM_RE      = re.compile(r'!')
-    _QUESTION_RE     = re.compile(r'\?')
-    _ELLIPSIS_RE     = re.compile(r'\.{2,}|…')
-    _EMDASH_RE       = re.compile(r'—|--|–')
-    _COMMA_RE        = re.compile(r',')
-    _SEMICOLON_RE    = re.compile(r';')
-    _COLON_RE        = re.compile(r':(?!//)')   # colon but not URL ://
-    _REPEATED_PUNCT  = re.compile(r'([!?.])\1{1,}')  # !! ?? ..
-    _ALL_CAPS_RE     = re.compile(r'\b[A-Z]{2,}\b')
-    _WORD_RE         = re.compile(r'\b\w+\b')
-    _SENT_RE         = re.compile(r'[.!?]+')
-    _NON_ASCII_RE    = re.compile(r'[^\x00-\x7F]')
-    _WHITESPACE_RE   = re.compile(r'\s+')
-    _URL_RE          = re.compile(r'https?://\S+|www\.\S+')
-    _HASHTAG_RE      = re.compile(r'#\w+')
-    _MENTION_RE      = re.compile(r'@\w+')
-    _DOLLAR_RE       = re.compile(r'\$')
-    _PERCENT_RE      = re.compile(r'%')
-    _STAR_RE         = re.compile(r'\*')
-    _QUOTE_RE        = re.compile(r'["\u201c\u201d\u2018\u2019]')
+    # ── Patterns ──────────────────────────────────────────────────────── #
+    _WORD_RE           = re.compile(r"\b\w+\b")
+    _SENT_SPLIT_RE     = re.compile(r"[.!?]+")
+    _EXCLAIM_RE        = re.compile(r"!")
+    _QUESTION_RE       = re.compile(r"\?")
+    _REPEATED_PUNCT    = re.compile(r"([!?.,'\"\\-])\1{1,}")
+    _ALL_CAPS_RE       = re.compile(r"\b[A-Z]{2,}\b")
+    _NON_ASCII_RE      = re.compile(r"[^\x00-\x7F]")
+    _URL_RE            = re.compile(r"https?://\S+|www\.\S+")
+    _ELLIPSIS_RE       = re.compile(r"\.{2,}|…")
+    _TERMINAL_PUNCT    = re.compile(r"[.!?\U0001F300-\U0001FAFF\"')\]]+\s*$")  # emoji counts as terminal
+    _GLUED_SENT_RE     = re.compile(r"[a-z][.!?][A-Z]")   # CG artifact only
 
-    # Common emoji categories
-    _FACE_EMOJI_RE   = re.compile(
-        u'[\U0001F600-\U0001F64F]', flags=re.UNICODE)
-    _SYMBOL_EMOJI_RE = re.compile(
-        u'[\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
-        u'\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F'
-        u'\U0001FA70-\U0001FAFF\U00002702-\U000027B0'
-        u'\U000024C2-\U0001F251]+', flags=re.UNICODE)
+    # Emoji — face + symbol ranges
+    _EMOJI_RE          = re.compile(
+        r"[\U0001F300-\U0001F5FF"
+        r"\U0001F600-\U0001F64F"
+        r"\U0001F680-\U0001F6FF"
+        r"\U0001F900-\U0001F9FF"
+        r"\U0001FA00-\U0001FA6F"
+        r"\U0001FA70-\U0001FAFF"
+        r"\u2702-\u27B0]+",
+        flags=re.UNICODE,
+    )
+    _FACE_EMOJI_RE     = re.compile(r"[\U0001F600-\U0001F64F]", flags=re.UNICODE)
 
-    def _count(self, pattern, text):
-        return len(pattern.findall(text))
+    _CONTRACTION_RE    = re.compile(
+        r"\b(i'm|you're|he's|she's|it's|we're|they're|i've|you've|we've|they've|"
+        r"i'd|you'd|he'd|she'd|we'd|they'd|i'll|you'll|he'll|she'll|we'll|they'll|"
+        r"isn't|aren't|wasn't|weren't|don't|doesn't|didn't|won't|wouldn't|can't|"
+        r"couldn't|shouldn't|haven't|hadn't|hasn't|that's|there's|here's|what's|"
+        r"who's|how's|let's|tbh|omg|imo|lol|btw|ngl|idk)\b",
+        re.IGNORECASE,
+    )
+    _FORMAL_RE         = re.compile(
+        r"\b(furthermore|moreover|consequently|therefore|thus|hence|additionally|"
+        r"subsequently|commendable|noteworthy|exceptional|remarkable|outstanding|"
+        r"superb|testament|craftsmanship|seamlessly|meticulously|delve|utilize|"
+        r"robust|well-written|well-developed|well-told|well-crafted|well-done|"
+        r"well-made|well-built|well-designed|well-thought)\b",
+        re.IGNORECASE,
+    )
+    _GENERIC_PRAISE_RE = re.compile(
+        r"\b(great product|great read|great book|great item|great purchase|"
+        r"highly recommend|very happy|very pleased|very satisfied|works great|"
+        r"works well|works perfectly|works as expected|as described|as advertised|"
+        r"love it|love this|would recommend|would buy again)\b",
+        re.IGNORECASE,
+    )
 
-    def _safe_ratio(self, numerator, denominator):
-        return numerator / denominator if denominator > 0 else 0.0
+    # ── Helpers ───────────────────────────────────────────────────────── #
+    def _count(self, pattern, text): return len(pattern.findall(text))
+    def _safe_ratio(self, n, d): return n / d if d > 0 else 0.0
 
     def _char_entropy(self, text):
-        """Shannon entropy of character distribution — low = AI (uniform), high = human."""
-        if not text:
-            return 0.0
-        freq = Counter(text)
-        total = len(text)
-        return -sum((c / total) * math.log2(c / total) for c in freq.values())
+        if not text: return 0.0
+        freq = Counter(text); total = len(text)
+        return -sum((c/total)*math.log2(c/total) for c in freq.values())
 
     def _punct_entropy(self, text):
-        """Entropy over punctuation characters only."""
-        punct = [c for c in text if unicodedata.category(c).startswith('P')]
-        if not punct:
-            return 0.0
-        freq = Counter(punct)
-        total = len(punct)
-        return -sum((c / total) * math.log2(c / total) for c in freq.values())
+        punct = [c for c in text if unicodedata.category(c).startswith("P")]
+        if not punct: return 0.0
+        freq = Counter(punct); total = len(punct)
+        return -sum((c/total)*math.log2(c/total) for c in freq.values())
 
-    def _get_emojis(self, text):
-        if EMOJI_AVAILABLE:
-            # emoji_lib.emoji_list returns list of dicts with 'emoji' key
-            return [e['emoji'] for e in emoji_lib.emoji_list(text)]
-        else:
-            # Fallback: use regex
-            return self._FACE_EMOJI_RE.findall(text) + self._SYMBOL_EMOJI_RE.findall(text)
+    def _bigram_rep(self, words):
+        bg = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        if not bg: return 0.0
+        freq = Counter(b.lower() for b in bg)
+        return sum(c-1 for c in freq.values() if c > 1) / len(bg)
 
+    def _trigram_rep(self, words):
+        tg = [f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words)-2)]
+        if not tg: return 0.0
+        freq = Counter(t.lower() for t in tg)
+        return sum(c-1 for c in freq.values() if c > 1) / len(tg)
+
+    # ── Main ──────────────────────────────────────────────────────────── #
     def extract(self, text: str) -> dict:
-        """
-        Extract all features from a single text string.
-        Returns a flat dict of feature_name -> float.
-        """
         if not isinstance(text, str):
             text = str(text) if text is not None else ""
+        t = text.strip()
+        n_chars = max(len(t), 1)
 
-        n_chars  = max(len(text), 1)
-        words    = self._WORD_RE.findall(text)
-        n_words  = max(len(words), 1)
-        sentences = [s for s in self._SENT_RE.split(text) if s.strip()]
-        n_sents  = max(len(sentences), 1)
+        words   = self._WORD_RE.findall(t)
+        n_words = max(len(words), 1)
+        sents   = [s.strip() for s in self._SENT_SPLIT_RE.split(t) if s.strip()]
+        n_sents = max(len(sents), 1)
+        slens   = [len(s.split()) for s in sents]
 
-        # --- Punctuation counts ---
-        n_exclaim    = self._count(self._EXCLAIM_RE, text)
-        n_question   = self._count(self._QUESTION_RE, text)
-        n_ellipsis   = self._count(self._ELLIPSIS_RE, text)
-        n_emdash     = self._count(self._EMDASH_RE, text)
-        n_comma      = self._count(self._COMMA_RE, text)
-        n_semicolon  = self._count(self._SEMICOLON_RE, text)
-        n_colon      = self._count(self._COLON_RE, text)
-        n_repeat_p   = self._count(self._REPEATED_PUNCT, text)
-        n_quote      = self._count(self._QUOTE_RE, text)
-        n_dollar     = self._count(self._DOLLAR_RE, text)
-        n_percent    = self._count(self._PERCENT_RE, text)
-        n_star       = self._count(self._STAR_RE, text)
-        n_hashtag    = self._count(self._HASHTAG_RE, text)
-        n_mention    = self._count(self._MENTION_RE, text)
+        # ── Punctuation ───────────────────────────────── #
+        n_exclaim  = self._count(self._EXCLAIM_RE, t)
+        n_question = self._count(self._QUESTION_RE, t)
+        n_ellipsis = self._count(self._ELLIPSIS_RE, t)
+        n_repeat_p = self._count(self._REPEATED_PUNCT, t)
+        n_caps     = self._count(self._ALL_CAPS_RE, t)
+        caps_ratio = sum(1 for c in t if c.isupper()) / n_chars
+        n_non_ascii= len(self._NON_ASCII_RE.findall(t))
 
-        # --- Casing ---
-        n_caps_words = self._count(self._ALL_CAPS_RE, text)
-        n_upper_chars = sum(1 for c in text if c.isupper())
-        n_lower_chars = sum(1 for c in text if c.islower())
+        # ── Emoji (modern AI signal) ───────────────────── #
+        emojis         = self._EMOJI_RE.findall(t)
+        n_emojis       = len(emojis)
+        n_unique_emojis= len(set(emojis))
+        n_face_emojis  = len(self._FACE_EMOJI_RE.findall(t))
+        has_emoji      = int(n_emojis > 0)
+        emoji_density  = self._safe_ratio(n_emojis, n_words)
+        emoji_diversity= self._safe_ratio(n_unique_emojis, n_emojis)
 
-        # --- Non-ASCII / Unicode ---
-        non_ascii    = self._NON_ASCII_RE.findall(text)
-        n_non_ascii  = len(non_ascii)
-        # Unicode categories
-        n_unicode_letter = sum(1 for c in text if unicodedata.category(c).startswith('L') and ord(c) > 127)
-        n_modifier_chars = sum(1 for c in text if unicodedata.category(c) in ('Lm', 'Sk'))
+        # ── CG artifact: truncation ────────────────────── #
+        # Strip trailing emojis before checking terminal punct
+        t_no_emoji = self._EMOJI_RE.sub("", t).strip()
+        is_truncated = int(not bool(self._TERMINAL_PUNCT.search(t_no_emoji)) and len(t_no_emoji) > 0)
+        last_term    = max((i for i, c in enumerate(t_no_emoji) if c in ".!?"), default=0)
+        chars_tail   = max(len(t_no_emoji) - last_term - 1, 0)
 
-        # --- Emoji features ---
-        emojis      = self._get_emojis(text)
-        n_emojis    = len(emojis)
-        n_unique_emojis = len(set(emojis))
-        # Emoji diversity: unique / total  (high = human variety, low = repetitive)
-        emoji_diversity = self._safe_ratio(n_unique_emojis, n_emojis)
-        emoji_word_ratio = self._safe_ratio(n_emojis, n_words)
-        face_emojis  = self._FACE_EMOJI_RE.findall(text)
-        n_face_emoji = len(face_emojis)
-        n_symb_emoji = n_emojis - n_face_emoji
+        # ── CG artifact: glued sentences ──────────────── #
+        n_glued    = self._count(self._GLUED_SENT_RE, t)
+        glued_ratio= self._safe_ratio(n_glued, n_sents)
 
-        # --- Ratios ---
-        exclaim_per_word  = self._safe_ratio(n_exclaim, n_words)
-        exclaim_per_sent  = self._safe_ratio(n_exclaim, n_sents)
-        question_per_sent = self._safe_ratio(n_question, n_sents)
-        emdash_per_sent   = self._safe_ratio(n_emdash, n_sents)
-        ellipsis_per_sent = self._safe_ratio(n_ellipsis, n_sents)
-        comma_per_sent    = self._safe_ratio(n_comma, n_sents)
-        caps_ratio        = self._safe_ratio(n_upper_chars, n_chars)
-        non_ascii_ratio   = self._safe_ratio(n_non_ascii, n_chars)
-        punct_density     = self._safe_ratio(
-            n_exclaim + n_question + n_comma + n_colon + n_semicolon, n_chars)
+        # ── Sentence structure / burstiness ───────────── #
+        slen_mean  = float(np.mean(slens)) if slens else 0.0
+        slen_std   = float(np.std(slens))  if len(slens) > 1 else 0.0
+        slen_range = float(max(slens) - min(slens)) if slens else 0.0
+        burstiness = self._safe_ratio(slen_std, slen_mean + 1e-6)
 
-        # --- Entropy features ---
-        char_entropy  = self._char_entropy(text)
-        punct_entropy = self._punct_entropy(text)
+        # ── Vocabulary richness ────────────────────────── #
+        wl         = [w.lower() for w in words]
+        wfreq      = Counter(wl)
+        ttr        = self._safe_ratio(len(set(wl)), n_words)
+        hapax_r    = self._safe_ratio(sum(1 for c in wfreq.values() if c==1), n_words)
+        wlens      = [len(w) for w in words]
+        wlen_mean  = float(np.mean(wlens)) if wlens else 0.0
+        wlen_std   = float(np.std(wlens))  if len(wlens) > 1 else 0.0
 
-        # --- Structural ---
-        avg_word_len  = np.mean([len(w) for w in words]) if words else 0.0
-        avg_sent_len  = self._safe_ratio(n_words, n_sents)
-        has_url       = int(bool(self._URL_RE.search(text)))
-        n_urls        = self._count(self._URL_RE, text)
+        # ── Repetition (CG signal) ────────────────────── #
+        bigram_rep = self._bigram_rep(words)
+        trigram_rep= self._trigram_rep(words)
+        n_generic  = self._count(self._GENERIC_PRAISE_RE, t)
+        generic_r  = self._safe_ratio(n_generic, n_words)
 
-        # --- AI-style signals (composite) ---
-        # AI tends to: no emojis, no repeated punct, low non-ASCII, balanced punctuation
-        ai_signal_score = (
-            (1.0 if n_emojis == 0 else 0.0) * 0.3 +
-            (1.0 if n_repeat_p == 0 else 0.0) * 0.2 +
-            (1.0 if n_non_ascii == 0 else 0.0) * 0.2 +
-            (1.0 if n_caps_words == 0 else 0.0) * 0.15 +
-            (1.0 if emdash_per_sent > 0.1 else 0.0) * 0.15
+        # ── Human vs generated vocabulary ─────────────── #
+        n_contr    = self._count(self._CONTRACTION_RE, t)
+        contr_r    = self._safe_ratio(n_contr, n_words)
+        n_formal   = self._count(self._FORMAL_RE, t)
+        formal_r   = self._safe_ratio(n_formal, n_words)
+
+        # ── Structural ────────────────────────────────── #
+        punct_d    = self._safe_ratio(n_exclaim + n_question + n_repeat_p, n_chars)
+        char_ent   = self._char_entropy(t)
+        punct_ent  = self._punct_entropy(t)
+
+        # ── Composite CG score (higher = more CG-like) ── #
+        cg_score = (
+            is_truncated                               * 0.20 +
+            (1.0 if n_glued > 0       else 0.0)       * 0.20 +   # CG-only artifact
+            (1.0 if burstiness < 0.25 else 0.0)        * 0.15 +
+            (1.0 if ttr < 0.75        else 0.0)        * 0.10 +
+            (1.0 if bigram_rep > 0.02 else 0.0)        * 0.10 +
+            (1.0 if n_caps == 0       else 0.0)        * 0.10 +
+            (1.0 if n_exclaim == 0    else 0.0)        * 0.08 +
+            (1.0 if contr_r < 0.005   else 0.0)        * 0.07
+        )
+
+        # ── Composite AI score (higher = more modern-AI-like) ── #
+        ai_score = (
+            has_emoji                                  * 0.30 +
+            (1.0 if n_words < 40      else 0.0)        * 0.25 +   # very short
+            (1.0 if contr_r < 0.02    else 0.0)        * 0.20 +   # few contractions
+            (1.0 if n_glued == 0      else 0.0)        * 0.15 +   # no CG artifact
+            (1.0 if ttr > 0.85        else 0.0)        * 0.10     # high vocab/word ratio
         )
 
         return {
-            # --- Exclamation ---
-            "n_exclaim": n_exclaim,
-            "exclaim_per_word": exclaim_per_word,
-            "exclaim_per_sent": exclaim_per_sent,
-            # --- Question ---
-            "n_question": n_question,
-            "question_per_sent": question_per_sent,
-            # --- Ellipsis & em-dash (AI loves these) ---
-            "n_ellipsis": n_ellipsis,
-            "ellipsis_per_sent": ellipsis_per_sent,
-            "n_emdash": n_emdash,
-            "emdash_per_sent": emdash_per_sent,
-            # --- Other punctuation ---
-            "n_comma": n_comma,
-            "comma_per_sent": comma_per_sent,
-            "n_semicolon": n_semicolon,
-            "n_colon": n_colon,
-            "n_repeated_punct": n_repeat_p,
-            "n_quote": n_quote,
-            "n_star": n_star,
-            "n_dollar": n_dollar,
-            "n_percent": n_percent,
-            "punct_density": punct_density,
-            # --- Casing ---
-            "n_caps_words": n_caps_words,
-            "caps_char_ratio": caps_ratio,
-            "n_upper_chars": n_upper_chars,
-            # --- Non-ASCII / Unicode ---
-            "n_non_ascii": n_non_ascii,
-            "non_ascii_ratio": non_ascii_ratio,
-            "n_unicode_letter": n_unicode_letter,
-            "n_modifier_chars": n_modifier_chars,
-            # --- Emoji ---
-            "n_emojis": n_emojis,
-            "n_unique_emojis": n_unique_emojis,
-            "emoji_diversity": emoji_diversity,
-            "emoji_word_ratio": emoji_word_ratio,
-            "n_face_emoji": n_face_emoji,
-            "n_symbol_emoji": n_symb_emoji,
-            # --- Social markers ---
-            "n_hashtags": n_hashtag,
-            "n_mentions": n_mention,
-            "n_urls": n_urls,
-            "has_url": has_url,
-            # --- Entropy ---
-            "char_entropy": char_entropy,
-            "punct_entropy": punct_entropy,
-            # --- Structure ---
-            "avg_word_len": avg_word_len,
-            "avg_sent_len": avg_sent_len,
-            "n_words": n_words,
-            "n_sentences": n_sents,
-            "n_chars": n_chars,
-            # --- Composite AI signal ---
-            "ai_signal_score": ai_signal_score,
+            # ── Emoji (modern AI signal) ──
+            "has_emoji":             has_emoji,
+            "n_emojis":              n_emojis,
+            "n_unique_emojis":       n_unique_emojis,
+            "n_face_emojis":         n_face_emojis,
+            "emoji_density":         emoji_density,
+            "emoji_diversity":       emoji_diversity,
+
+            # ── CG truncation ──
+            "is_truncated":          is_truncated,
+            "chars_tail":            chars_tail,
+
+            # ── CG glued sentences ──
+            "n_glued_sents":         n_glued,
+            "glued_ratio":           glued_ratio,
+
+            # ── Punctuation ──
+            "n_exclaim":             n_exclaim,
+            "exclaim_per_sent":      self._safe_ratio(n_exclaim, n_sents),
+            "n_question":            n_question,
+            "question_per_sent":     self._safe_ratio(n_question, n_sents),
+            "n_ellipsis":            n_ellipsis,
+            "n_repeated_punct":      n_repeat_p,
+            "punct_density":         punct_d,
+            "punct_entropy":         punct_ent,
+
+            # ── Casing ──
+            "n_caps_words":          n_caps,
+            "caps_char_ratio":       caps_ratio,
+
+            # ── Non-ASCII ──
+            "n_non_ascii":           n_non_ascii,
+            "non_ascii_ratio":       self._safe_ratio(n_non_ascii, n_chars),
+
+            # ── Length / structure ──
+            "n_words":               n_words,
+            "n_chars":               n_chars,
+            "n_sentences":           n_sents,
+            "sent_len_mean":         slen_mean,
+            "sent_len_std":          slen_std,
+            "sent_len_range":        slen_range,
+            "burstiness":            burstiness,
+
+            # ── Vocabulary richness ──
+            "type_token_ratio":      ttr,
+            "hapax_ratio":           hapax_r,
+            "avg_word_len":          wlen_mean,
+            "word_len_std":          wlen_std,
+
+            # ── Repetition ──
+            "bigram_repetition":     bigram_rep,
+            "trigram_repetition":    trigram_rep,
+            "n_generic_phrases":     n_generic,
+            "generic_phrase_ratio":  generic_r,
+
+            # ── Human vs generated vocabulary ──
+            "n_contractions":        n_contr,
+            "contraction_ratio":     contr_r,
+            "n_formal_words":        n_formal,
+            "formal_ratio":          formal_r,
+
+            # ── Structural ──
+            "has_url":               int(bool(self._URL_RE.search(t))),
+            "n_urls":                self._count(self._URL_RE, t),
+            "char_entropy":          char_ent,
+
+            # ── Composite scores ──
+            "cg_signal_score":       cg_score,
+            "ai_signal_score":       ai_score,
         }
 
     def transform(self, texts) -> pd.DataFrame:
-        """
-        Transform a list/Series of texts into a DataFrame of features.
-        Use this to get a feature matrix for model training.
-        """
         return pd.DataFrame([self.extract(t) for t in texts])
 
     @property
     def feature_names(self):
-        return list(self.extract("sample text!").keys())
+        return list(self.extract("sample.").keys())
 
 
-# ---------------------------------------------------------------------------
-# CLI / standalone usage
-# ---------------------------------------------------------------------------
-
+# ── CLI demo ──────────────────────────────────────────────────────────── #
 if __name__ == "__main__":
-    import os, sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
     extractor = SpecialCharFeatureExtractor()
-
-    test_cases = [
-        ("AI-style review",
-         "This product exceeded all my expectations. The quality is remarkable, "
-         "and the customer service was truly exceptional. I would highly recommend "
-         "it to anyone looking for a reliable solution."),
-
-        ("Human review with emojis",
-         "omg i LOVE this!! 😍😍 best purchase ever tbh... "
-         "kinda pricey but worth it 100%!! would def buy again 🛒✨"),
-
-        ("Fake/spam review",
-         "BEST PRODUCT EVER!!! BUY NOW!!! 5 STARS!!! AMAZING QUALITY!!! "
-         "FAST SHIPPING!!! HIGHLY RECOMMEND!!!"),
-
-        ("AI with em-dashes",
-         "The craftsmanship is superb—truly a testament to modern engineering. "
-         "Every detail has been considered—from the packaging to the finish—"
-         "making this an outstanding purchase."),
+    cases = [
+        ("OR — human",         "My dog LOVES these things! All I have to say is \"greenie\" and my dog starts jumping up and down. It's not too tall (I'm 5'7\")."),
+        ("CG — truncated",     "This is a great bag. I love the look and feel of it, and the size is perfect. I had to get a size down, as I wear a 6"),
+        ("CG — glued",         "A great read. The story is well told. The characters are well-developed.This is a great book to"),
+        ("AI — emoji",         "Got this mini fridge for my Silom condo to keep my skin care cool. Does exactly what it needs to do. 🧴❄️"),
+        ("AI — short+clean",   "This milk frother is changing my life. Makes perfect foam for my matcha lattes every morning. 🍵💚"),
     ]
-
-    print("=" * 70)
-    print("SPECIAL CHARACTER FEATURE EXTRACTION — DEMO")
-    print("=" * 70)
-
-    for label, text in test_cases:
-        feats = extractor.extract(text)
-        print(f"\n[{label}]")
-        print(f"  Text: {text[:80]}...")
-        print(f"  n_emojis={feats['n_emojis']}, n_exclaim={feats['n_exclaim']}, "
-              f"n_emdash={feats['n_emdash']}, n_ellipsis={feats['n_ellipsis']}")
-        print(f"  n_repeated_punct={feats['n_repeated_punct']}, "
-              f"non_ascii_ratio={feats['non_ascii_ratio']:.3f}, "
-              f"caps_ratio={feats['caps_char_ratio']:.3f}")
-        print(f"  char_entropy={feats['char_entropy']:.3f}, "
-              f"punct_entropy={feats['punct_entropy']:.3f}")
-        print(f"  ⚡ ai_signal_score={feats['ai_signal_score']:.2f}")
-
-    print("\n✅ Feature extractor working. Total features:", len(extractor.feature_names))
+    print(f"{'Type':<22} {'emoji':>5} {'trunc':>5} {'glued':>5} {'words':>5} {'ttr':>5} {'contr':>5} {'CG':>6} {'AI':>6}")
+    print("-" * 72)
+    for label, text in cases:
+        f = extractor.extract(text)
+        print(f"{label:<22} {f['n_emojis']:>5} {f['is_truncated']:>5} {f['n_glued_sents']:>5} "
+              f"{f['n_words']:>5} {f['type_token_ratio']:>5.2f} {f['n_contractions']:>5} "
+              f"{f['cg_signal_score']:>6.2f} {f['ai_signal_score']:>6.2f}")
+    print(f"\nTotal features: {len(extractor.feature_names)}")
