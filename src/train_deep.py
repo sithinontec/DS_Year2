@@ -150,10 +150,10 @@ def train_bilstm(splits, save_dir="models",
     val_texts   = splits["val_df"]["text_clean"].tolist()
     test_texts  = splits["test_df"]["text_clean"].tolist()
 
-    y_train = clean_labels(splits["train_df"], "Train")
-    y_val   = clean_labels(splits["val_df"], "Val")
-    y_test  = clean_labels(splits["test_df"], "Test")
-    
+    y_train = splits["train_df"], "Train"
+    y_val   = splits["val_df"], "Val"
+    y_test  = splits["test_df"], "Test"
+
     # Special char features
     X_sc_train = scaler.fit_transform(extractor.transform(train_texts).values)
     X_sc_val   = scaler.transform(extractor.transform(val_texts).values)
@@ -313,126 +313,6 @@ class BERTWithSpecialChar(nn.Module):
         return self.classifier(combined)
 
 
-def train_bert(splits, save_dir="models",
-               model_name="bert-base-uncased",
-               batch_size=16, epochs=3, lr=2e-5):
-    try:
-        from transformers import BertTokenizerFast, BertModel
-    except ImportError:
-        print("[train_bert] transformers not installed. Skipping BERT.")
-        return None
-
-    os.makedirs(save_dir, exist_ok=True)
-
-    extractor = SpecialCharFeatureExtractor()
-    scaler    = MinMaxScaler()
-
-    train_texts = splits["train_df"]["text_clean"].tolist()
-    val_texts   = splits["val_df"]["text_clean"].tolist()
-    test_texts  = splits["test_df"]["text_clean"].tolist()
-
-    y_train = splits["train_df"]["label"].values
-    y_val   = splits["val_df"]["label"].values
-    y_test  = splits["test_df"]["label"].values
-
-    X_sc_train = scaler.fit_transform(extractor.transform(train_texts).values)
-    X_sc_val   = scaler.transform(extractor.transform(val_texts).values)
-    X_sc_test  = scaler.transform(extractor.transform(test_texts).values)
-    n_special  = X_sc_train.shape[1]
-
-    print(f"\n[train_bert] Loading {model_name} tokenizer & model...")
-    bert_tokenizer = BertTokenizerFast.from_pretrained(model_name)
-    bert_base      = BertModel.from_pretrained(model_name)
-
-    train_ds = ReviewDatasetBERT(train_texts, X_sc_train, y_train, bert_tokenizer)
-    val_ds   = ReviewDatasetBERT(val_texts,   X_sc_val,   y_val,   bert_tokenizer)
-    test_ds  = ReviewDatasetBERT(test_texts,  X_sc_test,  y_test,  bert_tokenizer)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=0)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=0)
-
-    model     = BERTWithSpecialChar(bert_base, n_special).to(DEVICE)
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
-    criterion = nn.CrossEntropyLoss()
-
-    print("\n" + "=" * 60)
-    print(f"TRAINING: BERT + SpecialChar  (device={DEVICE})")
-    print("=" * 60)
-
-    best_val_acc = 0.0
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss, correct, total = 0.0, 0, 0
-        for batch in train_loader:
-            input_ids     = batch['input_ids'].to(DEVICE)
-            attention_mask= batch['attention_mask'].to(DEVICE)
-            special_feats = batch['special_feats'].to(DEVICE)
-            labels        = batch['labels'].to(DEVICE)
-
-            optimizer.zero_grad()
-            logits = model(input_ids, attention_mask, special_feats)
-            loss   = criterion(logits, labels)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            total_loss += loss.item() * len(labels)
-            correct    += (logits.argmax(1) == labels).sum().item()
-            total      += len(labels)
-
-        train_acc = correct / total
-        val_acc   = _eval_loader_bert(model, val_loader)
-        print(f"  Epoch {epoch}/{epochs}  loss={total_loss/total:.4f}  "
-              f"train_acc={train_acc:.4f}  val_acc={val_acc:.4f}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(save_dir, "bert_best.pt"))
-
-    model.load_state_dict(torch.load(os.path.join(save_dir, "bert_best.pt"),
-                                     map_location=DEVICE))
-    test_acc, test_report, test_auc = _full_eval_bert(model, test_loader, y_test)
-    print(f"\n  Test Accuracy: {test_acc:.4f}  ROC-AUC: {test_auc:.4f}")
-    print("  " + test_report)
-
-    joblib.dump(scaler, os.path.join(save_dir, "bert_scaler.pkl"))
-    print(f"  💾 Saved → {save_dir}/bert_best.pt")
-    return {"test_acc": test_acc, "test_auc": test_auc}
-
-
-def _eval_loader_bert(model, loader):
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for batch in loader:
-            logits  = model(batch['input_ids'].to(DEVICE),
-                            batch['attention_mask'].to(DEVICE),
-                            batch['special_feats'].to(DEVICE))
-            preds   = logits.argmax(1).cpu()
-            correct += (preds == batch['labels']).sum().item()
-            total   += len(batch['labels'])
-    return correct / total
-
-
-def _full_eval_bert(model, loader, y_true):
-    model.eval()
-    all_preds, all_proba = [], []
-    with torch.no_grad():
-        for batch in loader:
-            logits = model(batch['input_ids'].to(DEVICE),
-                           batch['attention_mask'].to(DEVICE),
-                           batch['special_feats'].to(DEVICE))
-            proba  = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            preds  = logits.argmax(1).cpu().numpy()
-            all_preds.extend(preds)
-            all_proba.extend(proba)
-    acc    = (np.array(all_preds) == y_true).mean()
-    report = classification_report(y_true, all_preds, target_names=["Real", "Fake/AI"])
-    auc    = roc_auc_score(y_true, all_proba)
-    return acc, report, auc
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -440,4 +320,3 @@ def _full_eval_bert(model, loader, y_true):
 if __name__ == "__main__":
     splits = load_dataset()
     train_bilstm(splits, epochs=5)
-    train_bert(splits, epochs=3)
