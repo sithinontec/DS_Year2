@@ -220,6 +220,8 @@ def train_classical_models(
     X_test_nb  = tfidf_char_nb.transform(test_texts)
     cnb = ComplementNB(alpha=0.1)
     cnb.fit(X_train_nb, y_train)
+    # Save the vectorizer alongside the model so evaluate.py can use it
+    joblib.dump(tfidf_char_nb, os.path.join(save_dir, 'ComplementNB_vectorizer.pkl'))
     _eval_and_save(cnb, "ComplementNB", X_val_nb, y_val, X_test_nb, y_test,
                    save_dir, results)
 

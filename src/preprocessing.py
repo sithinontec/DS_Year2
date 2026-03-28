@@ -11,7 +11,8 @@ Cleaning strategy:
   - Only strip HTML tags, null bytes, and collapse excessive whitespace
   - Do NOT lowercase for TF-IDF (ALL CAPS is a feature)
   - Do NOT strip punctuation (!, ?, repeated punct are features)
-  - Do NOT remove non-ASCII (non-ASCII ratio is a feature)
+  - remove_emoji=True strips emoji before cleaning — used for AI dataset
+    augmentation to prevent the model learning "has emoji = CG" as a shortcut
 """
 
 import re
@@ -21,56 +22,77 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 
 
-# ──────────────────────────────────────────────────────────────────────── #
-# Cleaning
-# ──────────────────────────────────────────────────────────────────────── #
+# ── Emoji pattern ────────────────────────────────────────────────────── #
 
-def preserve_special_clean(text: str) -> str:
+_EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001F5FF"
+    r"\U0001F600-\U0001F64F"
+    r"\U0001F680-\U0001F6FF"
+    r"\U0001F900-\U0001FAFF"
+    r"\u2702-\u27B0]+",
+    flags=re.UNICODE,
+)
+
+
+def strip_emoji(text: str) -> str:
+    """Remove all emoji from text."""
+    return _EMOJI_RE.sub("", str(text)).strip()
+
+
+# ── Cleaning ─────────────────────────────────────────────────────────── #
+
+def preserve_special_clean(text: str, remove_emoji: bool = False) -> str:
     """
     Minimal cleaning that preserves ALL special characters.
     Only removes HTML, null bytes, and collapses whitespace.
+
+    Parameters
+    ----------
+    remove_emoji : if True, strip emoji before cleaning.
+                   Use this when preparing AI-dataset text for training/scoring
+                   to prevent the model using emoji as a shortcut signal.
     """
     if not isinstance(text, str):
         return ""
-    text = re.sub(r"<[^>]+>", " ", text)   # strip HTML tags
-    text = text.replace("\x00", "")          # null bytes
-    text = re.sub(r"[ \t]+", " ", text)      # collapse spaces/tabs
-    text = re.sub(r"\n{3,}", "\n\n", text)   # collapse excessive newlines
+    if remove_emoji:
+        text = strip_emoji(text)
+    text = re.sub(r"<[^>]+>", " ", text)    # strip HTML tags
+    text = text.replace("\x00", "")           # null bytes
+    text = re.sub(r"[ \t]+", " ", text)       # collapse spaces/tabs
+    text = re.sub(r"\n{3,}", "\n\n", text)    # collapse excessive newlines
     return text.strip()
 
 
-# ──────────────────────────────────────────────────────────────────────── #
-# Dataset loader
-# ──────────────────────────────────────────────────────────────────────── #
+# ── Dataset loader ───────────────────────────────────────────────────── #
 
 def load_dataset(
     csv_path: str = None,
     test_size: float = 0.20,
-    val_size:  float = 0.10,
+    val_size: float = 0.10,
     random_state: int = 42,
-    category_filter: str = None,   # e.g. "Books_5" to train on one category
+    category_filter: str = None,
 ) -> dict:
     """
     Load fake_reviews_dataset_2022.csv and split into train/val/test.
 
     Parameters
     ----------
-    csv_path         : path to CSV; defaults to data/fake_reviews_dataset_2022.csv
+    csv_path         : path to CSV; auto-searches common locations if None
     test_size        : fraction held out for testing
     val_size         : fraction of training data held out for validation
     random_state     : reproducibility seed
-    category_filter  : if set, keep only this product category
+    category_filter  : if set, keep only this product category (e.g. "Books_5")
 
     Returns
     -------
-    dict with keys: train_df, val_df, test_df, full_df, label_map
+    dict with keys: train_df, val_df, test_df, full_df, label_map, label_names
     """
-    # ── Locate CSV ──────────────────────────────────────────────────── #
     if csv_path is None:
         candidates = [
             "data/fake_reviews_dataset_2022.csv",
             "/mnt/user-data/uploads/fake_reviews_dataset_2022.csv",
-            os.path.join(os.path.dirname(__file__), "..", "data", "fake_reviews_dataset_2022.csv"),
+            os.path.join(os.path.dirname(__file__), "..", "data",
+                         "fake_reviews_dataset_2022.csv"),
         ]
         for c in candidates:
             if os.path.exists(c):
@@ -78,48 +100,41 @@ def load_dataset(
                 break
         if csv_path is None:
             raise FileNotFoundError(
-                "Dataset not found. Pass csv_path= explicitly, or place the file at "
-                "data/fake_reviews_dataset_2022.csv"
+                "Dataset not found. Pass csv_path= explicitly, or place the "
+                "file at data/fake_reviews_dataset_2022.csv"
             )
 
     df = pd.read_csv(csv_path)
     print(f"[load_dataset] Loaded {len(df):,} rows from {csv_path}")
 
-    # ── Validate ────────────────────────────────────────────────────── #
     required = {"category", "rating", "label", "text_"}
-    missing  = required - set(df.columns)
+    missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns: {missing}. Found: {df.columns.tolist()}")
 
-    # ── Optional category filter ─────────────────────────────────────── #
     if category_filter:
         df = df[df["category"] == category_filter].copy()
-        print(f"[load_dataset] Filtered to category '{category_filter}': {len(df):,} rows")
+        print(f"[load_dataset] Filtered to '{category_filter}': {len(df):,} rows")
 
-    # ── Clean & remap labels ─────────────────────────────────────────── #
     df = df.dropna(subset=["text_"]).copy()
     df["text_clean"] = df["text_"].apply(preserve_special_clean)
 
-    # OR -> 0 (real/human), CG -> 1 (computer-generated)
     label_map = {"OR": 0, "CG": 1}
     df["label_int"] = df["label"].map(label_map)
 
     if df["label_int"].isna().any():
-        unique_labels = df["label"].unique()
         raise ValueError(
-            f"Unexpected label values: {unique_labels}. Expected 'OR' and 'CG'."
+            f"Unexpected label values: {df['label'].unique().tolist()}. "
+            "Expected 'OR' and 'CG'."
         )
 
-    # Keep useful metadata columns
     df = df[["text_", "text_clean", "label", "label_int", "category", "rating"]].copy()
     df = df.rename(columns={"label_int": "label_num"})
 
-    # ── Label distribution ───────────────────────────────────────────── #
     dist = df["label"].value_counts().to_dict()
     print(f"[load_dataset] Label distribution: {dist}  "
           f"(OR=real/human → 0, CG=generated → 1)")
 
-    # ── Train / val / test split ─────────────────────────────────────── #
     train_df, test_df = train_test_split(
         df, test_size=test_size,
         random_state=random_state, stratify=df["label_num"]
@@ -135,18 +150,16 @@ def load_dataset(
           f"train={len(train_df):,}  val={len(val_df):,}  test={len(test_df):,}")
 
     return {
-        "train_df":  train_df.reset_index(drop=True),
-        "val_df":    val_df.reset_index(drop=True),
-        "test_df":   test_df.reset_index(drop=True),
-        "full_df":   df.reset_index(drop=True),
-        "label_map": label_map,      # {"OR": 0, "CG": 1}
+        "train_df":    train_df.reset_index(drop=True),
+        "val_df":      val_df.reset_index(drop=True),
+        "test_df":     test_df.reset_index(drop=True),
+        "full_df":     df.reset_index(drop=True),
+        "label_map":   label_map,
         "label_names": ["OR (real)", "CG (generated)"],
     }
 
 
-# ──────────────────────────────────────────────────────────────────────── #
-# CLI
-# ──────────────────────────────────────────────────────────────────────── #
+# ── CLI ──────────────────────────────────────────────────────────────── #
 
 if __name__ == "__main__":
     splits = load_dataset()

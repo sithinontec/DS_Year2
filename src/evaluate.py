@@ -1,19 +1,18 @@
 """
 evaluate.py
 ===========
-Evaluates models trained on fake_reviews_dataset_2022.csv against:
-  1. The held-out test split (CG vs OR)
-  2. The AI dataset (fake_reviews_AI.csv) — out-of-distribution test
+Binary classification evaluation: OR (real/human) vs CG (computer-generated).
 
-The AI dataset has NO labels (it's entirely AI-generated).
-We treat it as a 100% positive class and measure detection rate.
+Both the 2022 CG dataset and the modern AI dataset are treated as the same CG class.
+The AI dataset (fake_reviews_AI.csv) is used as an additional CG test set — all
+reviews in it are generated, so we expect the model to flag all of them as CG.
 
-Also produces:
-  - Model comparison bar chart
+Produces:
+  - Model accuracy comparison bar chart
   - ROC curves
   - Confusion matrix (best model)
-  - Feature distribution plots for all three text types
-  - Score histogram: how well does each model separate OR / CG / AI?
+  - Feature distribution plots (OR vs CG 2022 vs AI/CG modern)
+  - Score distribution histogram
 """
 
 import os
@@ -24,7 +23,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.metrics import (
     classification_report, confusion_matrix,
     roc_auc_score, roc_curve, ConfusionMatrixDisplay,
@@ -32,16 +30,38 @@ from sklearn.metrics import (
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from src.preprocessing import load_dataset, preserve_special_clean
+try:
+    from src.preprocessing import strip_emoji
+except ImportError:
+    # Fallback if local preprocessing.py is an older version
+    import re as _re
+    def strip_emoji(text: str) -> str:
+        return _re.sub(
+            r'[\U0001F300-\U0001F5FF\U0001F600-\U0001F64F'
+            r'\U0001F680-\U0001F6FF\U0001F900-\U0001FAFF\u2702-\u27B0]+',
+            '', str(text), flags=_re.UNICODE).strip()
 from src.feature_engineering import SpecialCharFeatureExtractor
 from src.train_classical import build_feature_matrix
 
 
-# ── Inference helper ─────────────────────────────────────────────────── #
+# ── Inference ────────────────────────────────────────────────────────── #
 
 def predict_single(text: str, model_path: str, bundle_path: str) -> dict:
-    """Predict a single review. Returns prediction, confidence, and key features."""
-    bundle = joblib.load(bundle_path)
-    model  = joblib.load(model_path)
+    """
+    Predict whether a single review is OR (real) or CG (generated).
+
+    Parameters
+    ----------
+    text        : raw review text (emoji already stripped by caller if needed)
+    model_path  : path to a saved .pkl model
+    bundle_path : path to the feature_bundle.pkl from train_classical
+
+    Returns
+    -------
+    dict with prediction, confidence, cg_signal_score, and key feature values
+    """
+    bundle    = joblib.load(bundle_path)
+    model     = joblib.load(model_path)
     extractor = SpecialCharFeatureExtractor()
 
     cleaned = preserve_special_clean(text)
@@ -51,17 +71,17 @@ def predict_single(text: str, model_path: str, bundle_path: str) -> dict:
     feats   = extractor.extract(cleaned)
 
     return {
-        "text":              text[:100] + ("..." if len(text) > 100 else ""),
-        "prediction":        "Fake/Generated" if pred == 1 else "Real/Human",
-        "confidence":        round(conf, 4) if conf is not None else None,
-        "cg_signal_score":   round(feats["cg_signal_score"], 3),
-        "ai_signal_score":   round(feats["ai_signal_score"], 3),
-        "is_truncated":      feats["is_truncated"],
-        "n_glued_sents":     feats["n_glued_sents"],
-        "n_emojis":          feats["n_emojis"],
-        "n_words":           feats["n_words"],
-        "type_token_ratio":  round(feats["type_token_ratio"], 3),
-        "n_contractions":    feats["n_contractions"],
+        "text":             text[:100] + ("..." if len(text) > 100 else ""),
+        "prediction":       "CG (generated)" if pred == 1 else "OR (real)",
+        "confidence":       round(conf, 4) if conf is not None else None,
+        "cg_signal_score":  round(feats["cg_signal_score"], 3),
+        "is_truncated":     feats["is_truncated"],
+        "n_glued_sents":    feats["n_glued_sents"],
+        "n_words":          feats["n_words"],
+        "type_token_ratio": round(feats["type_token_ratio"], 3),
+        "n_contractions":   feats["n_contractions"],
+        "n_caps_words":     feats["n_caps_words"],
+        "burstiness":       round(feats["burstiness"], 3),
     }
 
 
@@ -73,11 +93,16 @@ def evaluate_all_models(
     models_dir:  str = "models",
     output_dir:  str = "outputs",
 ):
+    """
+    Evaluate all saved models on the held-out 2022 test split (OR vs CG).
+    If an AI CSV is provided, also report how many of those reviews are
+    correctly flagged as CG — since all are generated, higher = better.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
-    test_texts = splits["test_df"]["text_clean"].tolist()
-    y_test     = splits["test_df"]["label_num"].values
-    label_names= splits["label_names"]   # ["OR (real)", "CG (generated)"]
+    test_texts  = splits["test_df"]["text_clean"].tolist()
+    y_test      = splits["test_df"]["label_num"].values
+    label_names = splits["label_names"]    # ["OR (real)", "CG (generated)"]
 
     bundle_path = os.path.join(models_dir, "feature_bundle.pkl")
     if not os.path.exists(bundle_path):
@@ -85,92 +110,122 @@ def evaluate_all_models(
         return None
 
     bundle = joblib.load(bundle_path)
-
     print("Building test feature matrix...")
     X_test, _ = build_feature_matrix(test_texts, transformer_bundle=bundle, fit=False)
 
-    # ── Load AI dataset ─────────────────────────────────────────────── #
-    ai_df     = None
-    X_ai      = None
-    ai_texts  = []
+    # ── Load AI/CG dataset ───────────────────────────────────────────── #
+    ai_df    = None
+    X_ai     = None
+    ai_texts = []
 
-    ai_candidates = [
-        ai_csv_path,
-        "data/fake_reviews_AI.csv",
-        "/mnt/user-data/uploads/fake_reviews_AI.csv",
-    ]
-    for c in ai_candidates:
+    for c in [ai_csv_path, "data/fake_reviews_AI.csv",
+               "/mnt/user-data/uploads/fake_reviews_AI.csv"]:
         if c and os.path.exists(c):
             ai_df = pd.read_csv(c)
-            print(f"[evaluate] Loaded AI dataset: {len(ai_df):,} rows from {c}")
-            ai_df["text_clean"] = ai_df["text"].apply(preserve_special_clean)
-            ai_texts = ai_df["text_clean"].tolist()
-            print("Building AI feature matrix...")
-            X_ai, _ = build_feature_matrix(ai_texts, transformer_bundle=bundle, fit=False)
+            print(f"[evaluate] Loaded AI/CG dataset: {len(ai_df):,} rows from {c}")
+            # Strip emoji — prevents shortcut learning from dataset imbalance
+            ai_df["text_clean"] = ai_df["text"].apply(
+                lambda t: preserve_special_clean(strip_emoji(str(t)))
+            )
+            print("Building AI/CG feature matrix (emoji stripped)...")
+            X_ai, _ = build_feature_matrix(
+                ai_df["text_clean"].tolist(), transformer_bundle=bundle, fit=False
+            )
             break
 
     if ai_df is None:
-        print("[evaluate] AI dataset not found — skipping AI evaluation.")
+        print("[evaluate] AI/CG dataset not found — skipping.")
 
-    # ── Discover saved models ────────────────────────────────────────── #
-    skip = {"feature_bundle.pkl", "bilstm_tokenizer.pkl", "bilstm_scaler.pkl", "bert_scaler.pkl"}
+    # ── Discover models ──────────────────────────────────────────────── #
+    skip = {"feature_bundle.pkl"}
     model_files = {
         name.replace(".pkl", ""): os.path.join(models_dir, name)
         for name in sorted(os.listdir(models_dir))
         if name.endswith(".pkl") and name not in skip
     }
-
     if not model_files:
         print("[evaluate] No .pkl model files found in", models_dir)
         return None
 
-    results = {}
+    results  = {}
     roc_data = {}
 
-    print(f"\n{'Model':<35} {'Test acc':>9} {'Test AUC':>9}", end="")
+    header = f"{'Model':<35} {'Test acc':>9} {'Test AUC':>9}"
     if X_ai is not None:
-        print(f"  {'AI detect%':>10}", end="")
-    print()
-    print("-" * 70)
+        header += f"  {'AI/CG catch%':>12}"
+    print("\n" + header)
+    print("-" * (len(header) + 2))
 
     for name, path in model_files.items():
         try:
             model = joblib.load(path)
-            preds = model.predict(X_test)
-            acc   = (preds == y_test).mean()
-            auc   = None
-            ai_detect = None
+
+            # Route each model to the correct feature matrix.
+            # Some models were trained on a different feature space:
+            #   ComplementNB        → its own char TF-IDF (20k features)
+            #   GradientBoosting_SC → special-char features only (39 features)
+            #   RandomForest        → full bundle but dense
+            #   everything else     → full sparse bundle matrix (X_test / X_ai)
+            X_model_test = X_test
+            X_model_ai   = X_ai
+
+            if name == "ComplementNB":
+                vec_path = os.path.join(models_dir, "ComplementNB_vectorizer.pkl")
+                if not os.path.exists(vec_path):
+                    print(f"  ⚠️  {name}: vectorizer not found at {vec_path} — retrain to fix")
+                    continue
+                vec = joblib.load(vec_path)
+                X_model_test = vec.transform(test_texts)
+                if ai_texts:
+                    X_model_ai = vec.transform(ai_texts)
+
+            elif name == "GradientBoosting_SpecialChar":
+                sc_path  = os.path.join(models_dir, "GradientBoosting_SpecialChar_scaler.pkl")
+                ext_path = os.path.join(models_dir, "GradientBoosting_SpecialChar_extractor.pkl")
+                if not os.path.exists(sc_path):
+                    print(f"  ⚠️  {name}: scaler not found at {sc_path} — retrain to fix")
+                    continue
+                sc  = joblib.load(sc_path)
+                ext = joblib.load(ext_path)
+                X_model_test = sc.transform(ext.transform(test_texts).values)
+                if ai_texts:
+                    X_model_ai = sc.transform(ext.transform(ai_texts).values)
+
+            elif name == "RandomForest":
+                # RandomForest needs dense input
+                import scipy.sparse as sp
+                X_model_test = X_test.toarray() if sp.issparse(X_test) else X_test
+                if X_ai is not None:
+                    X_model_ai = X_ai.toarray() if sp.issparse(X_ai) else X_ai
+
+            preds    = model.predict(X_model_test)
+            acc      = (preds == y_test).mean()
+            auc      = None
+            ai_catch = None
 
             if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(X_test)[:, 1]
+                proba = model.predict_proba(X_model_test)[:, 1]
                 auc   = roc_auc_score(y_test, proba)
                 fpr, tpr, _ = roc_curve(y_test, proba)
                 roc_data[name] = (fpr, tpr, auc)
 
-            if X_ai is not None:
-                ai_preds  = model.predict(X_ai)
-                ai_detect = ai_preds.mean() * 100  # % flagged as generated
-
-            results[name] = {
-                "accuracy":   acc,
-                "auc":        auc,
-                "ai_detect%": ai_detect,
-                "precision_cg": None,
-                "recall_cg":    None,
-                "f1_cg":        None,
-            }
+            if X_model_ai is not None:
+                ai_catch = model.predict(X_model_ai).mean() * 100
 
             rep = classification_report(y_test, preds, output_dict=True)
-            results[name].update({
+            results[name] = {
+                "accuracy":     acc,
+                "auc":          auc,
+                "ai_cg_catch%": ai_catch,
                 "precision_cg": rep.get("1", {}).get("precision"),
                 "recall_cg":    rep.get("1", {}).get("recall"),
                 "f1_cg":        rep.get("1", {}).get("f1-score"),
-            })
+            }
 
-            print(f"  {name:<33} {acc:>9.4f} {str(round(auc,4)) if auc else 'N/A':>9}", end="")
+            row = f"  {name:<33} {acc:>9.4f} {str(round(auc, 4)) if auc else 'N/A':>9}"
             if X_ai is not None:
-                print(f"  {ai_detect:>9.1f}%", end="")
-            print()
+                row += f"  {ai_catch:>11.1f}%"
+            print(row)
 
         except Exception as e:
             print(f"  ⚠️  {name}: {e}")
@@ -178,71 +233,64 @@ def evaluate_all_models(
     # ── Best model full report ───────────────────────────────────────── #
     results_df = pd.DataFrame(results).T
     best_name  = results_df["accuracy"].idxmax()
-    best_path  = model_files[best_name]
-    best_model = joblib.load(best_path)
+    best_model = joblib.load(model_files[best_name])
 
     print(f"\n{'='*60}")
     print(f"BEST MODEL: {best_name}")
     print(f"{'='*60}")
-    print(classification_report(
-        y_test, best_model.predict(X_test),
-        target_names=label_names
-    ))
+    print(classification_report(y_test, best_model.predict(X_test),
+                                 target_names=label_names))
 
     if X_ai is not None and hasattr(best_model, "predict_proba"):
-        ai_proba  = best_model.predict_proba(X_ai)[:, 1]
-        ai_preds  = best_model.predict(X_ai)
-        print(f"AI dataset detection:  {ai_preds.mean()*100:.1f}% flagged as generated")
-        print(f"AI dataset avg confidence: {ai_proba.mean():.4f}")
-        print(f"AI dataset confidence ≥ 0.7: {(ai_proba >= 0.7).mean()*100:.1f}%")
-        print(f"AI dataset confidence ≥ 0.9: {(ai_proba >= 0.9).mean()*100:.1f}%")
+        ai_proba = best_model.predict_proba(X_ai)[:, 1]
+        print(f"AI/CG dataset — flagged as CG:")
+        print(f"  ≥ 0.5 confidence:  {(ai_proba >= 0.5).mean()*100:.1f}%")
+        print(f"  ≥ 0.7 confidence:  {(ai_proba >= 0.7).mean()*100:.1f}%")
+        print(f"  ≥ 0.9 confidence:  {(ai_proba >= 0.9).mean()*100:.1f}%")
 
-    # ── Save results CSV ─────────────────────────────────────────────── #
+    # ── Save & plot ──────────────────────────────────────────────────── #
     results_df.to_csv(os.path.join(output_dir, "model_comparison.csv"))
-
-    # ── Plots ─────────────────────────────────────────────────────────── #
     _plot_accuracy_bars(results_df, output_dir, has_ai=(X_ai is not None))
     if roc_data:
         _plot_roc(roc_data, output_dir)
     _plot_confusion(best_model, X_test, y_test, best_name, label_names, output_dir)
     _plot_feature_distributions(splits, ai_df, output_dir)
-
     if X_ai is not None:
         _plot_score_histograms(best_model, X_test, y_test, X_ai, best_name, output_dir)
 
-    print(f"\n✅ All plots saved to {output_dir}/")
+    print(f"\n✅ All outputs saved to {output_dir}/")
     return results_df
 
 
 # ── Plot helpers ─────────────────────────────────────────────────────── #
 
 def _plot_accuracy_bars(results_df, output_dir, has_ai=False):
-    fig, axes = plt.subplots(1, 2 if has_ai else 1,
-                              figsize=(14 if has_ai else 8, 5))
-    if not has_ai:
+    ncols  = 2 if has_ai else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 5))
+    if ncols == 1:
         axes = [axes]
 
-    # Test accuracy
-    ax = axes[0]
-    df = results_df.sort_values("accuracy", ascending=True)
+    df     = results_df.sort_values("accuracy", ascending=True)
     colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(df)))
-    bars = ax.barh(df.index, df["accuracy"], color=colors)
-    ax.set_xlabel("Accuracy"); ax.set_title("Test Accuracy (CG vs OR)", fontweight="bold")
-    ax.set_xlim(0, 1)
+    bars   = axes[0].barh(df.index, df["accuracy"], color=colors)
+    axes[0].set_xlabel("Accuracy")
+    axes[0].set_title("Test Accuracy — OR vs CG", fontweight="bold")
+    axes[0].set_xlim(0, 1)
     for bar, v in zip(bars, df["accuracy"]):
-        ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height()/2,
-                f"{v:.4f}", va="center", fontsize=9)
+        axes[0].text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+                     f"{v:.4f}", va="center", fontsize=9)
 
-    if has_ai and "ai_detect%" in results_df.columns:
-        ax2 = axes[1]
-        df2 = results_df.dropna(subset=["ai_detect%"]).sort_values("ai_detect%", ascending=True)
-        bars2 = ax2.barh(df2.index, df2["ai_detect%"], color=plt.cm.plasma(np.linspace(0.3, 0.9, len(df2))))
-        ax2.set_xlabel("% flagged as generated")
-        ax2.set_title("AI Dataset Detection Rate\n(% of modern AI reviews caught)", fontweight="bold")
-        ax2.set_xlim(0, 100)
-        for bar, v in zip(bars2, df2["ai_detect%"]):
-            ax2.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
-                     f"{v:.1f}%", va="center", fontsize=9)
+    if has_ai and "ai_cg_catch%" in results_df.columns:
+        df2   = results_df.dropna(subset=["ai_cg_catch%"]).sort_values("ai_cg_catch%", ascending=True)
+        bars2 = axes[1].barh(df2.index, df2["ai_cg_catch%"],
+                              color=plt.cm.plasma(np.linspace(0.3, 0.9, len(df2))))
+        axes[1].set_xlabel("% flagged as CG")
+        axes[1].set_title("AI/CG Dataset Catch Rate\n(all are generated — higher is better)",
+                          fontweight="bold")
+        axes[1].set_xlim(0, 100)
+        for bar, v in zip(bars2, df2["ai_cg_catch%"]):
+            axes[1].text(bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
+                         f"{v:.1f}%", va="center", fontsize=9)
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "model_comparison.png"), dpi=150, bbox_inches="tight")
@@ -251,11 +299,12 @@ def _plot_accuracy_bars(results_df, output_dir, has_ai=False):
 
 def _plot_roc(roc_data, output_dir):
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot([0,1],[0,1], "k--", alpha=0.4, label="Random")
-    for i, (name, (fpr, tpr, auc)) in enumerate(roc_data.items()):
+    ax.plot([0, 1], [0, 1], "k--", alpha=0.4, label="Random")
+    for name, (fpr, tpr, auc) in roc_data.items():
         ax.plot(fpr, tpr, lw=2, label=f"{name} (AUC={auc:.3f})")
-    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curves — CG Detection (test set)", fontweight="bold")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curves — OR vs CG", fontweight="bold")
     ax.legend(loc="lower right", fontsize=8)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "roc_curves.png"), dpi=150)
@@ -263,9 +312,11 @@ def _plot_roc(roc_data, output_dir):
 
 
 def _plot_confusion(model, X_test, y_test, name, label_names, output_dir):
-    cm   = confusion_matrix(y_test, model.predict(X_test))
+    cm  = confusion_matrix(y_test, model.predict(X_test))
     fig, ax = plt.subplots(figsize=(5, 4))
-    ConfusionMatrixDisplay(cm, display_labels=label_names).plot(ax=ax, colorbar=False, cmap="Blues")
+    ConfusionMatrixDisplay(cm, display_labels=label_names).plot(
+        ax=ax, colorbar=False, cmap="Blues"
+    )
     ax.set_title(f"Confusion Matrix — {name}", fontsize=11, fontweight="bold")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=150)
@@ -273,30 +324,31 @@ def _plot_confusion(model, X_test, y_test, name, label_names, output_dir):
 
 
 def _plot_feature_distributions(splits, ai_df, output_dir):
-    """Compare OR / CG / AI feature distributions side by side."""
+    """Feature distributions: OR vs CG 2022 vs AI/CG modern (emoji stripped)."""
     extractor = SpecialCharFeatureExtractor()
 
-    or_df = splits["full_df"][splits["full_df"]["label"] == "OR"].copy()
-    cg_df = splits["full_df"][splits["full_df"]["label"] == "CG"].copy()
+    or_feats = extractor.transform(
+        splits["full_df"][splits["full_df"]["label"] == "OR"]["text_"].astype(str).tolist()
+    )
+    cg_feats = extractor.transform(
+        splits["full_df"][splits["full_df"]["label"] == "CG"]["text_"].astype(str).tolist()
+    )
 
-    or_feats = extractor.transform(or_df["text_"].astype(str).tolist())
-    cg_feats = extractor.transform(cg_df["text_"].astype(str).tolist())
-
-    datasets = [("OR (real)", or_feats, "#2196F3"),
-                ("CG (generated)", cg_feats, "#FF9800")]
-
+    datasets = [
+        ("OR (real)",    or_feats, "#2196F3"),
+        ("CG 2022",      cg_feats, "#FF9800"),
+    ]
     if ai_df is not None:
-        ai_feats = extractor.transform(ai_df["text"].astype(str).tolist())
-        datasets.append(("AI (modern)", ai_feats, "#9C27B0"))
+        ai_feats = extractor.transform(ai_df["text_clean"].astype(str).tolist())
+        datasets.append(("AI / CG modern", ai_feats, "#E53935"))
 
     key_features = [
-        "is_truncated", "n_glued_sents", "has_emoji",
-        "n_words", "type_token_ratio", "burstiness",
-        "n_caps_words", "n_exclaim", "contraction_ratio",
-        "bigram_repetition", "cg_signal_score", "ai_signal_score",
+        "is_truncated", "n_glued_sents", "n_words",
+        "type_token_ratio", "burstiness", "n_caps_words",
+        "n_exclaim", "contraction_ratio", "bigram_repetition", "cg_signal_score",
     ]
 
-    fig, axes = plt.subplots(3, 4, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
     axes = axes.flatten()
 
     for i, feat in enumerate(key_features):
@@ -309,68 +361,71 @@ def _plot_feature_distributions(splits, ai_df, output_dir):
         ax.legend(fontsize=7)
         ax.set_yticks([])
 
-    fig.suptitle("Feature Distributions: OR vs CG vs AI",
+    fig.suptitle("Feature Distributions — OR (real) vs CG (all types)",
                  fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "feature_distributions.png"),
                 dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  📊 Feature distributions → {output_dir}/feature_distributions.png")
 
 
 def _plot_score_histograms(model, X_test, y_test, X_ai, model_name, output_dir):
-    """Show the model's confidence scores for OR, CG, and AI separately."""
+    """P(CG) score distributions for OR, CG 2022, and AI/CG modern."""
     if not hasattr(model, "predict_proba"):
         return
 
-    or_proba  = model.predict_proba(X_test[y_test == 0])[:, 1]
-    cg_proba  = model.predict_proba(X_test[y_test == 1])[:, 1]
-    ai_proba  = model.predict_proba(X_ai)[:, 1]
+    or_proba = model.predict_proba(X_test[y_test == 0])[:, 1]
+    cg_proba = model.predict_proba(X_test[y_test == 1])[:, 1]
+    ai_proba = model.predict_proba(X_ai)[:, 1]
 
     fig, ax = plt.subplots(figsize=(10, 5))
     bins = np.linspace(0, 1, 40)
-    ax.hist(or_proba, bins=bins, alpha=0.6, color="#2196F3",  label=f"OR/Real   (n={len(or_proba):,})",  density=True)
-    ax.hist(cg_proba, bins=bins, alpha=0.6, color="#FF9800",  label=f"CG 2022   (n={len(cg_proba):,})",  density=True)
-    ax.hist(ai_proba, bins=bins, alpha=0.6, color="#9C27B0",  label=f"AI modern (n={len(ai_proba):,})",  density=True)
-
-    ax.axvline(0.5, color="red", linestyle="--", alpha=0.7, label="Decision boundary (0.5)")
-    ax.set_xlabel("Model confidence score (probability of being generated)", fontsize=11)
+    ax.hist(or_proba, bins=bins, alpha=0.6, color="#2196F3",
+            label=f"OR / real  (n={len(or_proba):,})", density=True)
+    ax.hist(cg_proba, bins=bins, alpha=0.6, color="#FF9800",
+            label=f"CG 2022   (n={len(cg_proba):,})", density=True)
+    ax.hist(ai_proba, bins=bins, alpha=0.6, color="#E53935",
+            label=f"AI / CG modern (n={len(ai_proba):,})", density=True)
+    ax.axvline(0.5, color="black", linestyle="--", lw=1.5, label="Threshold 0.5")
+    ax.set_xlabel("P(CG / generated)", fontsize=11)
     ax.set_ylabel("Density")
-    ax.set_title(f"Score Distribution — {model_name}\n"
-                 f"CG detection: {(cg_proba>=0.5).mean()*100:.1f}%  |  "
-                 f"AI detection: {(ai_proba>=0.5).mean()*100:.1f}%  |  "
-                 f"OR false-positive: {(or_proba>=0.5).mean()*100:.1f}%",
-                 fontsize=11, fontweight="bold")
+    ax.set_title(
+        f"Score Distribution — {model_name}\n"
+        f"CG 2022 caught: {(cg_proba>=0.5).mean()*100:.1f}%  |  "
+        f"AI/CG caught: {(ai_proba>=0.5).mean()*100:.1f}%  |  "
+        f"OR false-positive: {(or_proba>=0.5).mean()*100:.1f}%",
+        fontsize=11, fontweight="bold"
+    )
     ax.legend(fontsize=10)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "score_distributions.png"), dpi=150)
     plt.close()
-    print(f"  📊 Score distributions → {output_dir}/score_distributions.png")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────── #
 if __name__ == "__main__":
+    from src.preprocessing import strip_emoji
+
     splits = load_dataset()
     evaluate_all_models(
         splits,
         ai_csv_path="/mnt/user-data/uploads/fake_reviews_AI.csv",
     )
 
-    # Single prediction demo
     bundle_path = "models/feature_bundle.pkl"
-    model_path  = "models/LogisticRegression.pkl"
+    model_path  = "models/LogisticRegression_augmented.pkl"
     if os.path.exists(bundle_path) and os.path.exists(model_path):
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("SINGLE-REVIEW INFERENCE DEMO")
-        print("="*60)
+        print("=" * 60)
         demos = [
-            "My dog LOVES these! It's not too tall (I'm 5'7\") -- great for the price!!!",
+            "My dog LOVES these! It's not too tall -- great for the price!!!",
             "This is a great bag. I love the look and feel of it. I had to get a size down, as I wear a 6",
-            "Got this mini fridge for my Silom condo. Does exactly what it needs to do. 🧴❄️",
+            strip_emoji("Got this mini fridge for my Silom condo. Does exactly what it needs to do. 🧴❄️"),
         ]
         for d in demos:
             r = predict_single(d, model_path, bundle_path)
             print(f"\n→ {r['prediction']}  (conf={r['confidence']})")
-            print(f"  emojis={r['n_emojis']}, words={r['n_words']}, trunc={r['is_truncated']}, glued={r['n_glued_sents']}")
-            print(f"  CG score={r['cg_signal_score']}  AI score={r['ai_signal_score']}")
+            print(f"  words={r['n_words']}, trunc={r['is_truncated']}, "
+                  f"glued={r['n_glued_sents']}, cg_score={r['cg_signal_score']}")
             print(f"  Text: {r['text']}")

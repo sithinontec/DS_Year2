@@ -1,26 +1,20 @@
 """
-feature_engineering.py  —  unified CG + AI feature extractor
-=============================================================
-Covers signals from BOTH text types:
+feature_engineering.py
+======================
+Extracts features that distinguish OR (original/human) from CG (computer-generated).
+Both the 2022 CG dataset and the modern AI dataset are the same CG class.
 
-  CG (computer-generated, 2022 dataset, GPT-2/3 era):
-    • Truncation mid-sentence (64.8%)
-    • Glued sentences  "love it.This"  (12.4%)
-    • Low vocab richness (TTR 0.72)
-    • Uniform sentence lengths (burstiness 0.37)
-    • Repeated bigrams/trigrams ("well-written... well-told")
-    • No ALL CAPS, few exclamations
+CG signals:
+  - Truncation mid-sentence        (64.8% CG 2022 / 18% AI)
+  - Glued sentences "love it.This" (12.4% CG 2022 only)
+  - Low vocab richness / TTR       (CG 2022)
+  - Uniform sentence lengths       (low burstiness)
+  - Bigram/trigram repetition      (CG 2022)
+  - Fewer ALL CAPS, fewer !        (both CG types)
+  - Low contraction ratio          (AI/modern CG)
+  - Short review length            (AI/modern CG ~30 words)
 
-  AI (modern LLM dataset):
-    • Emojis — 54.5% of reviews contain them
-    • Very short reviews (~30 words vs ~75 OR)
-    • High TTR (0.93) — varied vocabulary per short text
-    • Very low contractions (18% vs 68% OR)
-    • Polished sentence structure, high burstiness (0.60)
-    • Truncation still present (17.9%) but less extreme
-    • NO glued sentences
-
-Total features: 48
+Total features: 41
 """
 
 import re
@@ -38,26 +32,13 @@ class SpecialCharFeatureExtractor:
     _SENT_SPLIT_RE     = re.compile(r"[.!?]+")
     _EXCLAIM_RE        = re.compile(r"!")
     _QUESTION_RE       = re.compile(r"\?")
-    _REPEATED_PUNCT    = re.compile(r"([!?.,'\"\\-])\1{1,}")
+    _REPEATED_PUNCT    = re.compile(r"([!?.,'\"\-])\1{1,}")
     _ALL_CAPS_RE       = re.compile(r"\b[A-Z]{2,}\b")
     _NON_ASCII_RE      = re.compile(r"[^\x00-\x7F]")
     _URL_RE            = re.compile(r"https?://\S+|www\.\S+")
     _ELLIPSIS_RE       = re.compile(r"\.{2,}|…")
-    _TERMINAL_PUNCT    = re.compile(r"[.!?\U0001F300-\U0001FAFF\"')\]]+\s*$")  # emoji counts as terminal
-    _GLUED_SENT_RE     = re.compile(r"[a-z][.!?][A-Z]")   # CG artifact only
-
-    # Emoji — face + symbol ranges
-    _EMOJI_RE          = re.compile(
-        r"[\U0001F300-\U0001F5FF"
-        r"\U0001F600-\U0001F64F"
-        r"\U0001F680-\U0001F6FF"
-        r"\U0001F900-\U0001F9FF"
-        r"\U0001FA00-\U0001FA6F"
-        r"\U0001FA70-\U0001FAFF"
-        r"\u2702-\u27B0]+",
-        flags=re.UNICODE,
-    )
-    _FACE_EMOJI_RE     = re.compile(r"[\U0001F600-\U0001F64F]", flags=re.UNICODE)
+    _TERMINAL_PUNCT    = re.compile(r"[.!?\"')\]]+\s*$")
+    _GLUED_SENT_RE     = re.compile(r"[a-z][.!?][A-Z]")   # CG 2022 artifact
 
     _CONTRACTION_RE    = re.compile(
         r"\b(i'm|you're|he's|she's|it's|we're|they're|i've|you've|we've|they've|"
@@ -90,25 +71,25 @@ class SpecialCharFeatureExtractor:
     def _char_entropy(self, text):
         if not text: return 0.0
         freq = Counter(text); total = len(text)
-        return -sum((c/total)*math.log2(c/total) for c in freq.values())
+        return -sum((c / total) * math.log2(c / total) for c in freq.values())
 
     def _punct_entropy(self, text):
         punct = [c for c in text if unicodedata.category(c).startswith("P")]
         if not punct: return 0.0
         freq = Counter(punct); total = len(punct)
-        return -sum((c/total)*math.log2(c/total) for c in freq.values())
+        return -sum((c / total) * math.log2(c / total) for c in freq.values())
 
     def _bigram_rep(self, words):
-        bg = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        bg = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
         if not bg: return 0.0
         freq = Counter(b.lower() for b in bg)
-        return sum(c-1 for c in freq.values() if c > 1) / len(bg)
+        return sum(c - 1 for c in freq.values() if c > 1) / len(bg)
 
     def _trigram_rep(self, words):
-        tg = [f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words)-2)]
+        tg = [f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words) - 2)]
         if not tg: return 0.0
         freq = Counter(t.lower() for t in tg)
-        return sum(c-1 for c in freq.values() if c > 1) / len(tg)
+        return sum(c - 1 for c in freq.values() if c > 1) / len(tg)
 
     # ── Main ──────────────────────────────────────────────────────────── #
     def extract(self, text: str) -> dict:
@@ -123,7 +104,7 @@ class SpecialCharFeatureExtractor:
         n_sents = max(len(sents), 1)
         slens   = [len(s.split()) for s in sents]
 
-        # ── Punctuation ───────────────────────────────── #
+        # ── Punctuation ───────────────────────────────────────────────── #
         n_exclaim  = self._count(self._EXCLAIM_RE, t)
         n_question = self._count(self._QUESTION_RE, t)
         n_ellipsis = self._count(self._ELLIPSIS_RE, t)
@@ -132,149 +113,110 @@ class SpecialCharFeatureExtractor:
         caps_ratio = sum(1 for c in t if c.isupper()) / n_chars
         n_non_ascii= len(self._NON_ASCII_RE.findall(t))
 
-        # ── Emoji (modern AI signal) ───────────────────── #
-        emojis         = self._EMOJI_RE.findall(t)
-        n_emojis       = len(emojis)
-        n_unique_emojis= len(set(emojis))
-        n_face_emojis  = len(self._FACE_EMOJI_RE.findall(t))
-        has_emoji      = int(n_emojis > 0)
-        emoji_density  = self._safe_ratio(n_emojis, n_words)
-        emoji_diversity= self._safe_ratio(n_unique_emojis, n_emojis)
+        # ── CG truncation artifact ────────────────────────────────────── #
+        is_truncated = int(not bool(self._TERMINAL_PUNCT.search(t)) and len(t) > 0)
+        last_term    = max((i for i, c in enumerate(t) if c in ".!?"), default=0)
+        chars_tail   = max(n_chars - last_term - 1, 0)
 
-        # ── CG artifact: truncation ────────────────────── #
-        # Strip trailing emojis before checking terminal punct
-        t_no_emoji = self._EMOJI_RE.sub("", t).strip()
-        is_truncated = int(not bool(self._TERMINAL_PUNCT.search(t_no_emoji)) and len(t_no_emoji) > 0)
-        last_term    = max((i for i, c in enumerate(t_no_emoji) if c in ".!?"), default=0)
-        chars_tail   = max(len(t_no_emoji) - last_term - 1, 0)
+        # ── CG glued sentences artifact ───────────────────────────────── #
+        n_glued     = self._count(self._GLUED_SENT_RE, t)
+        glued_ratio = self._safe_ratio(n_glued, n_sents)
 
-        # ── CG artifact: glued sentences ──────────────── #
-        n_glued    = self._count(self._GLUED_SENT_RE, t)
-        glued_ratio= self._safe_ratio(n_glued, n_sents)
-
-        # ── Sentence structure / burstiness ───────────── #
+        # ── Sentence structure / burstiness ───────────────────────────── #
         slen_mean  = float(np.mean(slens)) if slens else 0.0
         slen_std   = float(np.std(slens))  if len(slens) > 1 else 0.0
         slen_range = float(max(slens) - min(slens)) if slens else 0.0
         burstiness = self._safe_ratio(slen_std, slen_mean + 1e-6)
 
-        # ── Vocabulary richness ────────────────────────── #
-        wl         = [w.lower() for w in words]
-        wfreq      = Counter(wl)
-        ttr        = self._safe_ratio(len(set(wl)), n_words)
-        hapax_r    = self._safe_ratio(sum(1 for c in wfreq.values() if c==1), n_words)
-        wlens      = [len(w) for w in words]
-        wlen_mean  = float(np.mean(wlens)) if wlens else 0.0
-        wlen_std   = float(np.std(wlens))  if len(wlens) > 1 else 0.0
+        # ── Vocabulary richness ───────────────────────────────────────── #
+        wl     = [w.lower() for w in words]
+        wfreq  = Counter(wl)
+        ttr    = self._safe_ratio(len(set(wl)), n_words)
+        hapax_r= self._safe_ratio(sum(1 for c in wfreq.values() if c == 1), n_words)
+        wlens  = [len(w) for w in words]
+        wlen_mean = float(np.mean(wlens)) if wlens else 0.0
+        wlen_std  = float(np.std(wlens))  if len(wlens) > 1 else 0.0
 
-        # ── Repetition (CG signal) ────────────────────── #
-        bigram_rep = self._bigram_rep(words)
-        trigram_rep= self._trigram_rep(words)
-        n_generic  = self._count(self._GENERIC_PRAISE_RE, t)
-        generic_r  = self._safe_ratio(n_generic, n_words)
+        # ── Repetition ───────────────────────────────────────────────── #
+        bigram_rep  = self._bigram_rep(words)
+        trigram_rep = self._trigram_rep(words)
+        n_generic   = self._count(self._GENERIC_PRAISE_RE, t)
+        generic_r   = self._safe_ratio(n_generic, n_words)
 
-        # ── Human vs generated vocabulary ─────────────── #
-        n_contr    = self._count(self._CONTRACTION_RE, t)
-        contr_r    = self._safe_ratio(n_contr, n_words)
-        n_formal   = self._count(self._FORMAL_RE, t)
-        formal_r   = self._safe_ratio(n_formal, n_words)
+        # ── Human vs CG vocabulary ────────────────────────────────────── #
+        n_contr  = self._count(self._CONTRACTION_RE, t)
+        contr_r  = self._safe_ratio(n_contr, n_words)
+        n_formal = self._count(self._FORMAL_RE, t)
+        formal_r = self._safe_ratio(n_formal, n_words)
 
-        # ── Structural ────────────────────────────────── #
-        punct_d    = self._safe_ratio(n_exclaim + n_question + n_repeat_p, n_chars)
-        char_ent   = self._char_entropy(t)
-        punct_ent  = self._punct_entropy(t)
+        # ── Structural ───────────────────────────────────────────────── #
+        punct_d  = self._safe_ratio(n_exclaim + n_question + n_repeat_p, n_chars)
+        char_ent = self._char_entropy(t)
+        punct_ent= self._punct_entropy(t)
 
-        # ── Composite CG score (higher = more CG-like) ── #
+        # ── Composite CG score (higher = more likely CG) ─────────────── #
         cg_score = (
-            is_truncated                               * 0.20 +
-            (1.0 if n_glued > 0       else 0.0)       * 0.20 +   # CG-only artifact
-            (1.0 if burstiness < 0.25 else 0.0)        * 0.15 +
-            (1.0 if ttr < 0.75        else 0.0)        * 0.10 +
-            (1.0 if bigram_rep > 0.02 else 0.0)        * 0.10 +
-            (1.0 if n_caps == 0       else 0.0)        * 0.10 +
-            (1.0 if n_exclaim == 0    else 0.0)        * 0.08 +
-            (1.0 if contr_r < 0.005   else 0.0)        * 0.07
-        )
-
-        # ── Composite AI score (higher = more modern-AI-like) ── #
-        ai_score = (
-            has_emoji                                  * 0.30 +
-            (1.0 if n_words < 40      else 0.0)        * 0.25 +   # very short
-            (1.0 if contr_r < 0.02    else 0.0)        * 0.20 +   # few contractions
-            (1.0 if n_glued == 0      else 0.0)        * 0.15 +   # no CG artifact
-            (1.0 if ttr > 0.85        else 0.0)        * 0.10     # high vocab/word ratio
+            is_truncated                                * 0.20 +
+            (1.0 if n_glued > 0        else 0.0)       * 0.20 +
+            (1.0 if burstiness < 0.25  else 0.0)        * 0.15 +
+            (1.0 if ttr < 0.75         else 0.0)        * 0.10 +
+            (1.0 if bigram_rep > 0.02  else 0.0)        * 0.10 +
+            (1.0 if n_caps == 0        else 0.0)        * 0.10 +
+            (1.0 if n_exclaim == 0     else 0.0)        * 0.08 +
+            (1.0 if contr_r < 0.005    else 0.0)        * 0.07
         )
 
         return {
-            # ── Emoji (modern AI signal) ──
-            "has_emoji":             has_emoji,
-            "n_emojis":              n_emojis,
-            "n_unique_emojis":       n_unique_emojis,
-            "n_face_emojis":         n_face_emojis,
-            "emoji_density":         emoji_density,
-            "emoji_diversity":       emoji_diversity,
-
             # ── CG truncation ──
-            "is_truncated":          is_truncated,
-            "chars_tail":            chars_tail,
-
+            "is_truncated":         is_truncated,
+            "chars_tail":           chars_tail,
             # ── CG glued sentences ──
-            "n_glued_sents":         n_glued,
-            "glued_ratio":           glued_ratio,
-
+            "n_glued_sents":        n_glued,
+            "glued_ratio":          glued_ratio,
             # ── Punctuation ──
-            "n_exclaim":             n_exclaim,
-            "exclaim_per_sent":      self._safe_ratio(n_exclaim, n_sents),
-            "n_question":            n_question,
-            "question_per_sent":     self._safe_ratio(n_question, n_sents),
-            "n_ellipsis":            n_ellipsis,
-            "n_repeated_punct":      n_repeat_p,
-            "punct_density":         punct_d,
-            "punct_entropy":         punct_ent,
-
+            "n_exclaim":            n_exclaim,
+            "exclaim_per_sent":     self._safe_ratio(n_exclaim, n_sents),
+            "n_question":           n_question,
+            "question_per_sent":    self._safe_ratio(n_question, n_sents),
+            "n_ellipsis":           n_ellipsis,
+            "n_repeated_punct":     n_repeat_p,
+            "punct_density":        punct_d,
+            "punct_entropy":        punct_ent,
             # ── Casing ──
-            "n_caps_words":          n_caps,
-            "caps_char_ratio":       caps_ratio,
-
+            "n_caps_words":         n_caps,
+            "caps_char_ratio":      caps_ratio,
             # ── Non-ASCII ──
-            "n_non_ascii":           n_non_ascii,
-            "non_ascii_ratio":       self._safe_ratio(n_non_ascii, n_chars),
-
+            "n_non_ascii":          n_non_ascii,
+            "non_ascii_ratio":      self._safe_ratio(n_non_ascii, n_chars),
             # ── Length / structure ──
-            "n_words":               n_words,
-            "n_chars":               n_chars,
-            "n_sentences":           n_sents,
-            "sent_len_mean":         slen_mean,
-            "sent_len_std":          slen_std,
-            "sent_len_range":        slen_range,
-            "burstiness":            burstiness,
-
+            "n_words":              n_words,
+            "n_chars":              n_chars,
+            "n_sentences":          n_sents,
+            "sent_len_mean":        slen_mean,
+            "sent_len_std":         slen_std,
+            "sent_len_range":       slen_range,
+            "burstiness":           burstiness,
             # ── Vocabulary richness ──
-            "type_token_ratio":      ttr,
-            "hapax_ratio":           hapax_r,
-            "avg_word_len":          wlen_mean,
-            "word_len_std":          wlen_std,
-
+            "type_token_ratio":     ttr,
+            "hapax_ratio":          hapax_r,
+            "avg_word_len":         wlen_mean,
+            "word_len_std":         wlen_std,
             # ── Repetition ──
-            "bigram_repetition":     bigram_rep,
-            "trigram_repetition":    trigram_rep,
-            "n_generic_phrases":     n_generic,
-            "generic_phrase_ratio":  generic_r,
-
-            # ── Human vs generated vocabulary ──
-            "n_contractions":        n_contr,
-            "contraction_ratio":     contr_r,
-            "n_formal_words":        n_formal,
-            "formal_ratio":          formal_r,
-
+            "bigram_repetition":    bigram_rep,
+            "trigram_repetition":   trigram_rep,
+            "n_generic_phrases":    n_generic,
+            "generic_phrase_ratio": generic_r,
+            # ── Human vs CG vocabulary ──
+            "n_contractions":       n_contr,
+            "contraction_ratio":    contr_r,
+            "n_formal_words":       n_formal,
+            "formal_ratio":         formal_r,
             # ── Structural ──
-            "has_url":               int(bool(self._URL_RE.search(t))),
-            "n_urls":                self._count(self._URL_RE, t),
-            "char_entropy":          char_ent,
-
-            # ── Composite scores ──
-            "cg_signal_score":       cg_score,
-            "ai_signal_score":       ai_score,
+            "has_url":              int(bool(self._URL_RE.search(t))),
+            "n_urls":               self._count(self._URL_RE, t),
+            "char_entropy":         char_ent,
+            # ── Composite CG score ──
+            "cg_signal_score":      cg_score,
         }
 
     def transform(self, texts) -> pd.DataFrame:
@@ -289,17 +231,28 @@ class SpecialCharFeatureExtractor:
 if __name__ == "__main__":
     extractor = SpecialCharFeatureExtractor()
     cases = [
-        ("OR — human",         "My dog LOVES these things! All I have to say is \"greenie\" and my dog starts jumping up and down. It's not too tall (I'm 5'7\")."),
-        ("CG — truncated",     "This is a great bag. I love the look and feel of it, and the size is perfect. I had to get a size down, as I wear a 6"),
-        ("CG — glued",         "A great read. The story is well told. The characters are well-developed.This is a great book to"),
-        ("AI — emoji",         "Got this mini fridge for my Silom condo to keep my skin care cool. Does exactly what it needs to do. 🧴❄️"),
-        ("AI — short+clean",   "This milk frother is changing my life. Makes perfect foam for my matcha lattes every morning. 🍵💚"),
+        ("OR — human",
+         "My dog LOVES these things! All I have to say is \"greenie\" and he starts "
+         "jumping up and down. It's not too expensive either."),
+        ("CG 2022 — truncated",
+         "This is a great bag. I love the look and feel of it, and the size is "
+         "perfect. I had to get a size down, as I wear a 6"),
+        ("CG 2022 — glued sentences",
+         "A great read. The story is well told. The characters are "
+         "well-developed.This is a great book to"),
+        ("AI / CG modern — short",
+         "Got this mini fridge for my Silom condo. Does exactly what it needs to do."),
+        ("AI / CG modern — polished",
+         "This milk frother is changing my life. Makes perfect foam every morning. "
+         "Takes 5 seconds to rinse."),
     ]
-    print(f"{'Type':<22} {'emoji':>5} {'trunc':>5} {'glued':>5} {'words':>5} {'ttr':>5} {'contr':>5} {'CG':>6} {'AI':>6}")
-    print("-" * 72)
+    print(f"{'Type':<30} {'trunc':>5} {'glued':>5} {'words':>5} {'ttr':>5} "
+          f"{'caps':>5} {'contr':>5} {'cg_score':>9}")
+    print("-" * 70)
     for label, text in cases:
         f = extractor.extract(text)
-        print(f"{label:<22} {f['n_emojis']:>5} {f['is_truncated']:>5} {f['n_glued_sents']:>5} "
-              f"{f['n_words']:>5} {f['type_token_ratio']:>5.2f} {f['n_contractions']:>5} "
-              f"{f['cg_signal_score']:>6.2f} {f['ai_signal_score']:>6.2f}")
+        print(f"{label:<30} {f['is_truncated']:>5} {f['n_glued_sents']:>5} "
+              f"{f['n_words']:>5} {f['type_token_ratio']:>5.2f} "
+              f"{f['n_caps_words']:>5} {f['n_contractions']:>5} "
+              f"{f['cg_signal_score']:>9.3f}")
     print(f"\nTotal features: {len(extractor.feature_names)}")
