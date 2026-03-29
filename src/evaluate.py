@@ -136,13 +136,16 @@ def evaluate_all_models(
     if ai_df is None:
         print("[evaluate] AI/CG dataset not found — skipping.")
 
-    # ── Discover models ──────────────────────────────────────────────── #
-    skip = {"feature_bundle.pkl"}
-    model_files = {
-        name.replace(".pkl", ""): os.path.join(models_dir, name)
-        for name in sorted(os.listdir(models_dir))
-        if name.endswith(".pkl") and name not in skip
-    }
+    # ── Load only the two expected models by explicit name ──────────── #
+    # Avoids accidentally picking up stale .pkl files from old training runs
+    # (scalers, vectorizers, extractors, or models from removed experiments).
+    model_files = {}
+    for name in ["LogisticRegression", "RandomForest"]:
+        path = os.path.join(models_dir, f"{name}.pkl")
+        if os.path.exists(path):
+            model_files[name] = path
+        else:
+            print(f"  ⚠️  {name}.pkl not found in {models_dir} — run train_models() first")
     if not model_files:
         print("[evaluate] No .pkl model files found in", models_dir)
         return None
@@ -160,43 +163,21 @@ def evaluate_all_models(
         try:
             model = joblib.load(path)
 
-            # Route each model to the correct feature matrix.
-            # Some models were trained on a different feature space:
-            #   ComplementNB        → its own char TF-IDF (20k features)
-            #   GradientBoosting_SC → special-char features only (39 features)
-            #   RandomForest        → full bundle but dense
-            #   everything else     → full sparse bundle matrix (X_test / X_ai)
-            X_model_test = X_test
-            X_model_ai   = X_ai
-
-            if name == "ComplementNB":
-                vec_path = os.path.join(models_dir, "ComplementNB_vectorizer.pkl")
-                if not os.path.exists(vec_path):
-                    print(f"  ⚠️  {name}: vectorizer not found at {vec_path} — retrain to fix")
-                    continue
-                vec = joblib.load(vec_path)
-                X_model_test = vec.transform(test_texts)
-                if ai_texts:
-                    X_model_ai = vec.transform(ai_texts)
-
-            elif name == "GradientBoosting_SpecialChar":
-                sc_path  = os.path.join(models_dir, "GradientBoosting_SpecialChar_scaler.pkl")
-                ext_path = os.path.join(models_dir, "GradientBoosting_SpecialChar_extractor.pkl")
+            # RandomForest was trained on 39 special-char features (not TF-IDF)
+            # so we rebuild its feature matrix using the saved scaler + extractor.
+            if name == "RandomForest":
+                sc_path  = os.path.join(models_dir, 'RandomForest_scaler.pkl')
+                ext_path = os.path.join(models_dir, 'RandomForest_extractor.pkl')
                 if not os.path.exists(sc_path):
-                    print(f"  ⚠️  {name}: scaler not found at {sc_path} — retrain to fix")
+                    print(f"  ⚠️  {name}: scaler not found — retrain to fix")
                     continue
-                sc  = joblib.load(sc_path)
-                ext = joblib.load(ext_path)
-                X_model_test = sc.transform(ext.transform(test_texts).values)
-                if ai_texts:
-                    X_model_ai = sc.transform(ext.transform(ai_texts).values)
-
-            elif name == "RandomForest":
-                # RandomForest needs dense input
-                import scipy.sparse as sp
-                X_model_test = X_test.toarray() if sp.issparse(X_test) else X_test
-                if X_ai is not None:
-                    X_model_ai = X_ai.toarray() if sp.issparse(X_ai) else X_ai
+                _sc  = joblib.load(sc_path)
+                _ext = joblib.load(ext_path)
+                X_model_test = _sc.transform(_ext.transform(test_texts).values)
+                X_model_ai   = _sc.transform(_ext.transform(ai_texts).values) if ai_texts else None
+            else:
+                X_model_test = X_test
+                X_model_ai   = X_ai
 
             preds    = model.predict(X_model_test)
             acc      = (preds == y_test).mean()
